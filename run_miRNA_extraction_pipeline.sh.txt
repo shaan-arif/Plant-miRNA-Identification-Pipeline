@@ -1,0 +1,193 @@
+#!/bin/bash
+
+set -eou pipefail
+
+# Load conda environment with required tools (FastQC, Trimmomatic, Bowtie, etc.)
+source ~/.bashrc
+conda activate sRNAseq_analysis
+
+# -----------------------------
+# USER-DEFINED DIRECTORIES
+# -----------------------------
+FASTQ_DIR="data/fastq"        # Input FASTQ files (paired-end reads)
+ADAPTER_DIR="data/adapters"   # Adapter sequences (for trimming)
+RFAM_DIR="data/rfam"          # Rfam sequences (ncRNA filtering)
+MIRBASE_DIR="data/mirbase"    # Known miRNA sequences (from miRBase)
+RESULTS_DIR="results"         # Output directory
+GENOME_DIR="genome"           # Reference genome
+
+# Subdirectories for specific outputs
+FASTQC_DIR="$RESULTS_DIR/fastqc"
+TRIM_DIR="$RESULTS_DIR/trimmed"
+ALIGN_DIR="$RESULTS_DIR/alignment"
+
+# Create output folders if they don’t already exist
+mkdir -p $FASTQC_DIR $TRIM_DIR $ALIGN_DIR
+
+# -----------------------------
+# BOWTIE INDEX BUILDING
+# -----------------------------
+# Build indices for Rfam, miRBase, and genome only once
+# (skip if already built — avoids wasting time)
+if [ ! -f "$RFAM_DIR/rfam.1.ebwt" ]; then
+    bowtie-build "$RFAM_DIR/rfam_combined.fasta" "$RFAM_DIR/rfam"
+fi
+
+if [ ! -f "$MIRBASE_DIR/mirbase.1.ebwt" ]; then
+    bowtie-build "$MIRBASE_DIR/mirbase.fa" "$MIRBASE_DIR/mirbase"
+fi
+
+if [ ! -f "$GENOME_DIR/genome.1.ebwt" ]; then
+    bowtie-build "$GENOME_DIR/genome.fa" "$GENOME_DIR/genome"
+fi
+
+# -----------------------------
+# PROCESS EACH SAMPLE
+# -----------------------------
+# This loop automatically detects all paired-end FASTQ files
+# Example: SAMPLE_1.fastq and SAMPLE_2.fastq
+for fq1 in $FASTQ_DIR/*_1.fastq; do
+    filename=$(basename "$fq1")
+    SAMPLE=${filename%_1.fastq}
+    fq2="$FASTQ_DIR/${SAMPLE}_2.fastq"
+
+    echo "======================"
+    echo "Processing sample: $SAMPLE"
+    echo "======================"
+
+    # -----------------------------
+    # STEP 1: Quality control (FastQC)
+    # -----------------------------
+    # Generates reports on read quality, GC content, adapter contamination
+    fastqc "$fq1" -o "$FASTQC_DIR"
+    fastqc "$fq2" -o "$FASTQC_DIR"
+
+    # -----------------------------
+    # STEP 2: Adapter & quality trimming (Trimmomatic)
+    # -----------------------------
+    # Removes sequencing adapters and trims low-quality bases
+    trimmomatic PE -threads 4 \
+        "$fq1" "$fq2" \
+        "$TRIM_DIR/${SAMPLE}_1.pairedtrimmed.fastq" "$TRIM_DIR/${SAMPLE}_1.unpairedtrimmed.fastq" \
+        "$TRIM_DIR/${SAMPLE}_2.pairedtrimmed.fastq" "$TRIM_DIR/${SAMPLE}_2.unpairedtrimmed.fastq" \
+        ILLUMINACLIP:$ADAPTER_DIR/TruSeq-RA3-RA5.fa:2:30:10 SLIDINGWINDOW:10:20
+
+    # -----------------------------
+    # STEP 3: Poly-A trimming and merging (Cutadapt)
+    # -----------------------------
+    # Removes artificial long poly-A tails and enforces read length (18–34 nt)
+    cutadapt -a "A{20}" -A "A{20}" -m 18 -M 34 \
+        -o "$TRIM_DIR/${SAMPLE}_1.polyAtrimmed.fastq" \
+        -p "$TRIM_DIR/${SAMPLE}_2.polyAtrimmed.fastq" \
+        "$TRIM_DIR/${SAMPLE}_1.pairedtrimmed.fastq" "$TRIM_DIR/${SAMPLE}_2.pairedtrimmed.fastq"
+
+    # Merge trimmed paired-end reads into a single file
+    cat "$TRIM_DIR/${SAMPLE}_1.polyAtrimmed.fastq" "$TRIM_DIR/${SAMPLE}_2.polyAtrimmed.fastq" \
+        > "$TRIM_DIR/${SAMPLE}_combined.fastq"
+
+    # Convert FASTQ → FASTA 
+    seqtk seq -a "$TRIM_DIR/${SAMPLE}_combined.fastq" > "$TRIM_DIR/${SAMPLE}_combined.fa"
+
+    # -----------------------------
+    # STEP 4: Collapse identical sequences (FASTX-Toolkit)
+    # -----------------------------
+    # Collapses reads to unique tags with counts (saves memory and speeds alignment)
+    fastx_collapser -i "$TRIM_DIR/${SAMPLE}_combined.fa" -o "$TRIM_DIR/${SAMPLE}_unique_tags.fa"
+    sed -i 's/-/_x/' "$TRIM_DIR/${SAMPLE}_unique_tags.fa"   # Format IDs consistently
+
+    # -----------------------------
+    # STEP 5: Remove non-miRNA ncRNAs (Bowtie vs Rfam)
+    # -----------------------------
+    # Filters out tRNAs, rRNAs, snRNAs, etc. using Rfam database
+    bowtie "$RFAM_DIR/rfam" -f "$TRIM_DIR/${SAMPLE}_unique_tags.fa" \
+        -S "$ALIGN_DIR/${SAMPLE}_ncRNA.sam" \
+        --un "$ALIGN_DIR/${SAMPLE}_unaligned_ncRNA.fa"
+
+    # -----------------------------
+    # STEP 6: Align to known miRNAs (miRBase)
+    # -----------------------------
+    # Matches reads to known mature miRNAs
+    bowtie "$MIRBASE_DIR/mirbase" -n 2 -f "$ALIGN_DIR/${SAMPLE}_unaligned_ncRNA.fa" \
+        -S "$ALIGN_DIR/${SAMPLE}_mirbase.sam" \
+        --un "$ALIGN_DIR/${SAMPLE}_forNovelPrediction.fa"
+
+    # -----------------------------
+    # STEP 7: Extract known miRNAs
+    # -----------------------------
+    # From the SAM file, extract reads that aligned to known miRNAs
+    grep -v "^@" "$ALIGN_DIR/${SAMPLE}_mirbase.sam" | \
+        awk -F"\t" '{if($3!="*") print}' | cut -f 1,3 | sort -u > "$ALIGN_DIR/${SAMPLE}_known_miRNAs.txt" || true
+
+    # -----------------------------
+    # STEP 8: Align remaining reads to reference genome
+    # -----------------------------
+    # Required before precursor detection
+    bowtie "$GENOME_DIR/genome" -f "$ALIGN_DIR/${SAMPLE}_forNovelPrediction.fa" \
+        -S "$ALIGN_DIR/${SAMPLE}.genome.sam"
+
+    # -----------------------------
+    # STEP 9: Convert SAM → BLAST-like format (miRDP2 requirement)
+    # -----------------------------
+    perl convert_SAM_to_blast.pl \
+        "$ALIGN_DIR/${SAMPLE}.genome.sam" \
+        "$ALIGN_DIR/${SAMPLE}_forNovelPrediction.fa" \
+        "$GENOME_DIR/genome.fa" > "$ALIGN_DIR/${SAMPLE}.genome.bst"
+
+    # -----------------------------
+    # STEP 10: Filter alignments
+    # -----------------------------
+    # Keep only perfect or near-perfect matches (<= cutoff, here the cutoff is kept as 15, i.e, appear ≤ 15 times in the genome)
+    perl filter_alignments.pl \
+        "$ALIGN_DIR/${SAMPLE}.genome.bst" -c 15 > "$ALIGN_DIR/${SAMPLE}.genome.filter15.bst"
+
+    # Extract filtered reads into FASTA
+    perl filter_alignments.pl \
+        "$ALIGN_DIR/${SAMPLE}.genome.filter15.bst" -b "$ALIGN_DIR/${SAMPLE}_forNovelPrediction.fa" \
+        > "$ALIGN_DIR/${SAMPLE}.genome.filter15.filtered.fa"
+
+    # -----------------------------
+    # STEP 11: Excise precursor sequences
+    # -----------------------------
+    # Extract genomic regions (~250 nt around mapped reads) as candidate miRNA precursors
+    perl excise_candidate.pl \
+        "$GENOME_DIR/genome.fa" \
+        "$ALIGN_DIR/${SAMPLE}.genome.filter15.bst" 250 \
+        > "$ALIGN_DIR/${SAMPLE}.genome.filter15.precursors.fa"
+
+    # -----------------------------
+    # STEP 12: Predict secondary structure (RNAfold)
+    # -----------------------------
+    # Folding candidate precursors to check for hairpin structures
+    RNAfold --noPS < "$ALIGN_DIR/${SAMPLE}.genome.filter15.precursors.fa" \
+        > "$ALIGN_DIR/${SAMPLE}.genome.filter15.structures"
+
+    # -----------------------------
+    # STEP 13: Align reads to precursors → generate signatures
+    # -----------------------------
+    bowtie-build -f "$ALIGN_DIR/${SAMPLE}.genome.filter15.precursors.fa" \
+        "$ALIGN_DIR/${SAMPLE}.genome.filter15.precursors"
+
+    bowtie "$ALIGN_DIR/${SAMPLE}.genome.filter15.precursors" \
+        -f "$ALIGN_DIR/${SAMPLE}.genome.filter15.filtered.fa" \
+        -S "$ALIGN_DIR/${SAMPLE}.genome.filter15.precursors.sam"
+
+    perl convert_SAM_to_blast.pl \
+        "$ALIGN_DIR/${SAMPLE}.genome.filter15.precursors.sam" \
+        "$ALIGN_DIR/${SAMPLE}.genome.filter15.filtered.fa" \
+        "$ALIGN_DIR/${SAMPLE}.genome.filter15.precursors.fa" \
+        > "$ALIGN_DIR/${SAMPLE}.precursors.bst"
+
+    # Sort alignments to produce precursor signatures (GNU sort syntax)
+    sort -k4,25 "$ALIGN_DIR/${SAMPLE}.precursors.bst" > "$ALIGN_DIR/${SAMPLE}.signatures"
+
+    # -----------------------------
+    # STEP 14: Predict novel miRNAs (miRDP2)
+    # -----------------------------
+    # Core step: identify novel miRNAs based on structure + read signatures
+    perl mod-miRDP.pl \
+        "$ALIGN_DIR/${SAMPLE}.signatures" \
+        "$ALIGN_DIR/${SAMPLE}.genome.filter15.structures" -y \
+        > "$ALIGN_DIR/${SAMPLE}.novel_miRNAs.txt"
+
+    echo "✅ Novel miRNA prediction completed for $SAMPLE"
+done
